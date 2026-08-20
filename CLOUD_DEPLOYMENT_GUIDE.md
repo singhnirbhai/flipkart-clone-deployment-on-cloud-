@@ -57,12 +57,12 @@ Step 1.2 - Configure AWS Credentials
   # Verify
   aws sts get-caller-identity
 
-  # Expected:
-  {
-     "UserId": "AIDA...",
-     "Account": "123456789012",
-     "Arn": "arn:aws:iam::123456789012:user/yourname"
-   }
+  ## Expected:
+  ##{
+  ##  "UserId": "AIDA...",
+  ##   "Account": "123456789012",
+  ##   "Arn": "arn:aws:iam::123456789012:user/yourname"
+  ##}
 
 
 Step 1.3 - Install eksctl
