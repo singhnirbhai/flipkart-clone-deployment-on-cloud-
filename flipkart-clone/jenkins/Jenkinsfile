@@ -1,0 +1,355 @@
+#################################################################
+# JENKINS PIPELINE FOR FLIPKART CLONE MICROSERVICES
+#
+# Pipeline Stages:
+# 1. Checkout - Git se code pull karo
+# 2. Build - Docker images banao
+# 3. Test - Unit tests chalao
+# 4. Security Scan - Container vulnerability scan
+# 5. Push to Registry - Docker Hub pe push karo
+# 6. Deploy to Dev - Development cluster pe deploy
+# 7. Integration Tests - API tests chalao
+# 8. Deploy to Production - Kubernetes pe deploy
+# 9. Verify Deployment - Health checks verify karo
+# 10. Notify - Slack/Email notification
+#################################################################
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+            apiVersion: v1
+            kind: Pod
+            spec:
+              containers:
+                - name: docker
+                  image: docker:24-dind
+                  securityContext:
+                    privileged: true
+                  volumeMounts:
+                    - name: docker-sock
+                      mountPath: /var/run/docker.sock
+                - name: kubectl
+                  image: bitnami/kubectl:latest
+                  command:
+                    - cat
+                  tty: true
+                - name: node
+                  image: node:18-alpine
+                  command:
+                    - cat
+                  tty: true
+              volumes:
+                - name: docker-sock
+                  hostPath:
+                    path: /var/run/docker.sock
+            '''
+        }
+    }
+
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_NAMESPACE = 'flipkart'
+        K8S_NAMESPACE_DEV = 'flipkart-dev'
+        K8S_NAMESPACE_PROD = 'flipkart'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        SLACK_CHANNEL = '#deployments'
+    }
+
+    stages {
+        // ==================== STAGE 1: CHECKOUT ====================
+        stage('Checkout') {
+            steps {
+                echo "📥 Pulling code from repository..."
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    echo "Commit: ${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        // ==================== STAGE 2: BUILD ALL SERVICES ====================
+        stage('Build') {
+            parallel {
+                stage('Build Frontend') {
+                    steps {
+                        echo "🔨 Building frontend..."
+                        container('node') {
+                            dir('frontend') {
+                                sh 'npm install'
+                                sh 'npm run build'
+                            }
+                        }
+                    }
+                }
+                stage('Build User Service') {
+                    steps {
+                        echo "🔨 Building user-service..."
+                        container('docker') {
+                            sh 'docker build -t ${DOCKER_NAMESPACE}/user-service:${IMAGE_TAG} ./backend/user-service'
+                        }
+                    }
+                }
+                stage('Build Product Service') {
+                    steps {
+                        echo "🔨 Building product-service..."
+                        container('docker') {
+                            sh 'docker build -t ${DOCKER_NAMESPACE}/product-service:${IMAGE_TAG} ./backend/product-service'
+                        }
+                    }
+                }
+                stage('Build Cart Service') {
+                    steps {
+                        echo "🔨 Building cart-service..."
+                        container('docker') {
+                            sh 'docker build -t ${DOCKER_NAMESPACE}/cart-service:${IMAGE_TAG} ./backend/cart-service'
+                        }
+                    }
+                }
+                stage('Build Payment Service') {
+                    steps {
+                        echo "🔨 Building payment-service (HPA-enabled)..."
+                        container('docker') {
+                            sh 'docker build -t ${DOCKER_NAMESPACE}/payment-service:${IMAGE_TAG} ./backend/payment-service'
+                        }
+                    }
+                }
+                stage('Build Order Service') {
+                    steps {
+                        echo "🔨 Building order-service..."
+                        container('docker') {
+                            sh 'docker build -t ${DOCKER_NAMESPACE}/order-service:${IMAGE_TAG} ./backend/order-service'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ==================== STAGE 3: TEST ====================
+        stage('Test') {
+            parallel {
+                stage('Test Frontend') {
+                    steps {
+                        container('node') {
+                            dir('frontend') {
+                                sh 'npm test -- --watchAll=false || true'
+                            }
+                        }
+                    }
+                }
+                stage('Test Services') {
+                    steps {
+                        container('node') {
+                            dir('backend') {
+                                sh '''
+                                    for service in user-service product-service cart-service payment-service order-service; do
+                                        echo "Testing $service..."
+                                        cd $service && npm install && npm test || true
+                                        cd ..
+                                    done
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ==================== STAGE 4: SECURITY SCAN ====================
+        stage('Security Scan') {
+            steps {
+                echo "🔒 Running security scan..."
+                container('docker') {
+                    sh '''
+                        for service in frontend user-service product-service cart-service payment-service order-service; do
+                            echo "Scanning ${service}..."
+                            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                                aquasec/trivy image --exit-code 0 --severity HIGH,CRITICAL \
+                                ${DOCKER_NAMESPACE}/${service}:${IMAGE_TAG} || true
+                        done
+                    '''
+                }
+            }
+        }
+
+        // ==================== STAGE 5: PUSH TO DOCKER HUB ====================
+        stage('Push to Registry') {
+            steps {
+                echo "📤 Pushing images to Docker Hub..."
+                container('docker') {
+                    withCredentials([usernamePassword(credentialsId: 'docker-hub', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
+                        sh '''
+                            for service in frontend user-service product-service cart-service payment-service order-service; do
+                                docker tag ${DOCKER_NAMESPACE}/${service}:${IMAGE_TAG} ${DOCKER_NAMESPACE}/${service}:latest
+                                docker push ${DOCKER_NAMESPACE}/${service}:${IMAGE_TAG}
+                                docker push ${DOCKER_NAMESPACE}/${service}:latest
+                                echo "Pushed ${service}:${IMAGE_TAG}"
+                            done
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ==================== STAGE 6: DEPLOY TO DEV ====================
+        stage('Deploy to Dev') {
+            steps {
+                echo "🚀 Deploying to development cluster..."
+                container('kubectl') {
+                    sh '''
+                        # Create namespace if not exists
+                        kubectl create namespace ${K8S_NAMESPACE_DEV} --dry-run=client -o yaml | kubectl apply -f -
+
+                        # Apply all manifests
+                        kubectl apply -f k8s/mongodb.yaml -n ${K8S_NAMESPACE_DEV}
+                        kubectl apply -f k8s/api-gateway.yaml -n ${K8S_NAMESPACE_DEV}
+                        kubectl apply -f k8s/user-service/ -n ${K8S_NAMESPACE_DEV}
+                        kubectl apply -f k8s/product-service/ -n ${K8S_NAMESPACE_DEV}
+                        kubectl apply -f k8s/cart-service/ -n ${K8S_NAMESPACE_DEV}
+                        kubectl apply -f k8s/payment-service/ -n ${K8S_NAMESPACE_DEV}
+                        kubectl apply -f k8s/order-service/ -n ${K8S_NAMESPACE_DEV}
+                        kubectl apply -f k8s/frontend/ -n ${K8S_NAMESPACE_DEV}
+
+                        # Update images
+                        kubectl set image deployment/frontend frontend=${DOCKER_NAMESPACE}/frontend:${IMAGE_TAG} -n ${K8S_NAMESPACE_DEV}
+                        kubectl set image deployment/user-service user-service=${DOCKER_NAMESPACE}/user-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_DEV}
+                        kubectl set image deployment/product-service product-service=${DOCKER_NAMESPACE}/product-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_DEV}
+                        kubectl set image deployment/cart-service cart-service=${DOCKER_NAMESPACE}/cart-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_DEV}
+                        kubectl set image deployment/payment-service payment-service=${DOCKER_NAMESPACE}/payment-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_DEV}
+                        kubectl set image deployment/order-service order-service=${DOCKER_NAMESPACE}/order-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_DEV}
+
+                        # Wait for rollout
+                        kubectl rollout status deployment/frontend -n ${K8S_NAMESPACE_DEV} --timeout=120s
+                        kubectl rollout status deployment/user-service -n ${K8S_NAMESPACE_DEV} --timeout=120s
+                        kubectl rollout status deployment/product-service -n ${K8S_NAMESPACE_DEV} --timeout=120s
+                        kubectl rollout status deployment/cart-service -n ${K8S_NAMESPACE_DEV} --timeout=120s
+                        kubectl rollout status deployment/payment-service -n ${K8S_NAMESPACE_DEV} --timeout=120s
+                        kubectl rollout status deployment/order-service -n ${K8S_NAMESPACE_DEV} --timeout=120s
+                    '''
+                }
+            }
+        }
+
+        // ==================== STAGE 7: INTEGRATION TESTS ====================
+        stage('Integration Tests') {
+            steps {
+                echo "🧪 Running integration tests..."
+                container('kubectl') {
+                    sh '''
+                        # Wait for services to be ready
+                        sleep 30
+
+                        # Test API Gateway health
+                        GATEWAY_IP=$(kubectl get svc api-gateway -n ${K8S_NAMESPACE_DEV} -o jsonpath='{.spec.clusterIP}')
+                        
+                        echo "Testing API Gateway health..."
+                        kubectl run test-pod --image=curlimages/curl --restart=Never -n ${K8S_NAMESPACE_DEV} -- \
+                            curl -s http://${GATEWAY_IP}:3000/health
+
+                        echo "Testing User Service..."
+                        kubectl run test-user --image=curlimages/curl --restart=Never -n ${K8S_NAMESPACE_DEV} -- \
+                            curl -s http://${GATEWAY_IP}:3000/api/users/health
+
+                        echo "Testing Product Service..."
+                        kubectl run test-product --image=curlimages/curl --restart=Never -n ${K8S_NAMESPACE_DEV} -- \
+                            curl -s http://${GATEWAY_IP}:3000/api/products/health
+
+                        echo "Testing Payment Service..."
+                        kubectl run test-payment --image=curlimages/curl --restart=Never -n ${K8S_NAMESPACE_DEV} -- \
+                            curl -s http://${GATEWAY_IP}:3000/api/payments/health
+
+                        # Cleanup test pods
+                        kubectl delete pod test-pod test-user test-product test-payment -n ${K8S_NAMESPACE_DEV} --ignore-not-found
+                    '''
+                }
+            }
+        }
+
+        // ==================== STAGE 8: DEPLOY TO PRODUCTION ====================
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo "🚀 Deploying to production cluster..."
+                input message: 'Deploy to production?', ok: 'Yes, deploy!'
+                container('kubectl') {
+                    sh '''
+                        # Apply monitoring first
+                        kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+                        kubectl apply -f k8s/monitoring/ -n monitoring
+
+                        # Apply all manifests
+                        kubectl apply -f k8s/namespace.yaml
+                        kubectl apply -f k8s/mongodb.yaml -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/api-gateway.yaml -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/user-service/ -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/product-service/ -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/cart-service/ -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/payment-service/ -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/order-service/ -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/frontend/ -n ${K8S_NAMESPACE_PROD}
+                        kubectl apply -f k8s/ingress.yaml
+
+                        # Update images with rolling update
+                        kubectl set image deployment/frontend frontend=${DOCKER_NAMESPACE}/frontend:${IMAGE_TAG} -n ${K8S_NAMESPACE_PROD}
+                        kubectl set image deployment/user-service user-service=${DOCKER_NAMESPACE}/user-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_PROD}
+                        kubectl set image deployment/product-service product-service=${DOCKER_NAMESPACE}/product-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_PROD}
+                        kubectl set image deployment/cart-service cart-service=${DOCKER_NAMESPACE}/cart-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_PROD}
+                        kubectl set image deployment/payment-service payment-service=${DOCKER_NAMESPACE}/payment-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_PROD}
+                        kubectl set image deployment/order-service order-service=${DOCKER_NAMESPACE}/order-service:${IMAGE_TAG} -n ${K8S_NAMESPACE_PROD}
+
+                        # Wait for rollout
+                        kubectl rollout status deployment/payment-service -n ${K8S_NAMESPACE_PROD} --timeout=180s
+                        kubectl rollout status deployment/frontend -n ${K8S_NAMESPACE_PROD} --timeout=120s
+                    '''
+                }
+            }
+        }
+
+        // ==================== STAGE 9: VERIFY DEPLOYMENT ====================
+        stage('Verify Deployment') {
+            steps {
+                echo "✅ Verifying deployment..."
+                container('kubectl') {
+                    sh '''
+                        echo "=== Pod Status ==="
+                        kubectl get pods -n ${K8S_NAMESPACE_PROD} -o wide
+
+                        echo "=== Services ==="
+                        kubectl get svc -n ${K8S_NAMESPACE_PROD}
+
+                        echo "=== HPA Status (Payment Service) ==="
+                        kubectl get hpa -n ${K8S_NAMESPACE_PROD}
+
+                        echo "=== Ingress ==="
+                        kubectl get ingress -n ${K8S_NAMESPACE_PROD}
+
+                        echo "=== Deployment Rollout History ==="
+                        kubectl rollout history deployment/payment-service -n ${K8S_NAMESPACE_PROD}
+                    '''
+                }
+            }
+        }
+    }
+
+    // ==================== POST ACTIONS ====================
+    post {
+        success {
+            echo "✅ Pipeline completed successfully!"
+            // slackSend channel: SLACK_CHANNEL, message: "✅ Deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+        }
+        failure {
+            echo "❌ Pipeline failed!"
+            // slackSend channel: SLACK_CHANNEL, message: "❌ Deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

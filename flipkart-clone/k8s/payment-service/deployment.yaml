@@ -1,0 +1,208 @@
+#################################################################
+# PAYMENT SERVICE - WITH HORIZONTAL POD AUTOSCALER (HPA)
+#
+# HPA kaise kaam karta hai:
+# 1. payment-service /metrics endpoint se CPU, memory, 
+#    active_payments, payment_requests collect karta hai
+# 2. Prometheus ye metrics scrape karta hai
+# 3. HPA Prometheus se metrics dekh kar pods add/remove karta hai
+#
+# Jab CPU 60% ya custom metric zyada hoga -> naya pod up
+# Jab load kam hoga -> pod remove hoga
+#################################################################
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: flipkart
+  labels:
+    app: payment-service
+    tier: critical
+spec:
+  # HPA will manage replicas - no fixed replica count
+  # minReplicas/maxReplicas are set in HPA manifest
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+        tier: critical
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3004"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: payment-service
+          image: flipkart/payment-service:latest
+          ports:
+            - name: http
+              containerPort: 3004
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "3004"
+            - name: MONGO_URI
+              value: "mongodb://mongodb:27017/flipkart_payments"
+            - name: NODE_ENV
+              value: "production"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          # Readiness probe - pod tabhi traffic lega jab ready ho
+          readinessProbe:
+            httpGet:
+              path: /api/payments/health
+              port: 3004
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness probe - pod restart if unhealthy
+          livenessProbe:
+            httpGet:
+              path: /api/payments/health
+              port: 3004
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          # Graceful shutdown
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: payment-service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: flipkart
+  labels:
+    app: payment-service
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "3004"
+spec:
+  type: ClusterIP
+  selector:
+    app: payment-service
+  ports:
+    - name: http
+      port: 3004
+      targetPort: 3004
+      protocol: TCP
+---
+#################################################################
+# HORIZONTAL POD AUTOSCALER (HPA) FOR PAYMENT SERVICE
+#
+# Scaling Rules:
+# - CPU-based: Agar CPU 60% se zyada ho -> pods badhao
+# - Memory-based: Agar memory 70% se zyada ho -> pods badhao
+# - Custom metric: payment_active_processing 5 se zyada -> scale up
+#
+# Min pods: 2
+# Max pods: 10
+# Stabilization window: 60s (itna wait karega scale decisions ke liye)
+#################################################################
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-service-hpa
+  namespace: flipkart
+  labels:
+    app: payment-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+  minReplicas: 2
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+      selectPolicy: Min
+  metrics:
+    # METRIC 1: CPU Utilization
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # METRIC 2: Memory Utilization
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # METRIC 3: Custom metric - Active Payment Processing
+    # Jab zyada payments process ho rahe hain -> scale up
+    - type: Pods
+      pods:
+        metric:
+          name: payment_active_processing
+        target:
+          type: AverageValue
+          averageValue: "5"
+
+    # METRIC 4: Custom metric - HTTP Request Rate
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_total
+        target:
+          type: AverageValue
+          averageValue: "100"
+
+---
+#################################################################
+# POD DISRUPTION BUDGET
+# Ensures at least 1 payment pod always running during
+# node drains, cluster upgrades etc.
+#################################################################
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service-pdb
+  namespace: flipkart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: payment-service
