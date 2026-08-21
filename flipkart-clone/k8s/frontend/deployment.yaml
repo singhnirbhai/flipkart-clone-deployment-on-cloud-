@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: flipkart/frontend:latest
+          image: nirbhaisingh/flipkart-frontend
           ports:
             - containerPort: 80
           resources:

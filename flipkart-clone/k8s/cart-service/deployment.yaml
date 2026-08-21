@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: cart-service
-          image: flipkart/cart-service:latest
+          image: nirbhaisingh/flipkart-cart-service:latest
           ports:
             - containerPort: 3003
           env:

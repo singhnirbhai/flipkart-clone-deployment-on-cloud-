@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: product-service
-          image: flipkart/product-service:latest
+          image: nirbhaisingh/flipkart-product-service:latest
           ports:
             - containerPort: 3002
           env:
