@@ -146,8 +146,9 @@ Step 2.1 - Create IAM User for EKS
 --------------------------------------
 
   # Create IAM policy for EKS admin
-  ``` cat <<'EOF' > eks-admin-policy.json
-  {
+  ```
+cat <<'EOF' > eks-admin-policy.json
+{
     "Version": "2012-10-17",
     "Statement": [
       {
@@ -196,7 +197,7 @@ Step 2.1 - Create IAM User for EKS
 
 Step 2.2 - Create EKS Cluster Role
 --------------------------------------
-
+```
   cat <<'EOF' > trust-policy.json
   {
     "Version": "2012-10-17",
@@ -211,7 +212,7 @@ Step 2.2 - Create EKS Cluster Role
     ]
   }
   EOF
-
+```
   # Create role
   aws iam create-role \
     --role-name EksClusterRole \
@@ -231,6 +232,7 @@ Step 2.2 - Create EKS Cluster Role
 Step 2.3 - Create Node Group Role
 -------------------------------------
 
+  ```
   cat <<'EOF' > node-trust-policy.json
   {
     "Version": "2012-10-17",
@@ -245,7 +247,7 @@ Step 2.3 - Create Node Group Role
     ]
   }
   EOF
-
+```
   aws iam create-role \
     --role-name EksNodeRole \
     --assume-role-policy-document file://node-trust-policy.json
