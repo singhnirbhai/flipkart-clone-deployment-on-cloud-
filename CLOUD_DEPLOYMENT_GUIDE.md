@@ -146,7 +146,7 @@ Step 2.1 - Create IAM User for EKS
 --------------------------------------
 
   # Create IAM policy for EKS admin
-  cat <<'EOF' > eks-admin-policy.json
+  ``` cat <<'EOF' > eks-admin-policy.json
   {
     "Version": "2012-10-17",
     "Statement": [
@@ -169,6 +169,7 @@ Step 2.1 - Create IAM User for EKS
     ]
   }
   EOF
+```
 
   aws iam create-policy \
     --policy-name EksAdminPolicy \
